@@ -41,6 +41,7 @@ from mcp_types import (
 )
 from mcp_types.version import LATEST_MODERN_VERSION, MODERN_PROTOCOL_VERSIONS
 from pydantic import Field
+from sse_starlette.sse import AppStatus
 from starlette.types import Message, Receive, Scope, Send
 from trio.testing import MockClock
 
@@ -1353,3 +1354,66 @@ async def test_json_response_mode_still_streams_subscriptions_listen() -> None:
         "io.modelcontextprotocol/subscriptionId": 9,
         SERVER_INFO_META_KEY: {"name": "test", "version": "1.2.3"},
     }
+
+
+@pytest.mark.parametrize(
+    "anyio_backend",
+    [pytest.param(("trio", {"clock": MockClock(autojump_threshold=0)}), id="trio-mockclock")],
+)
+async def test_server_shutdown_ends_open_listen_stream_with_terminating_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SDK-defined (#3806): a committed SSE response ends when the process starts shutting
+    down, closing with the terminating chunk so the client sees a clean end rather than a
+    dropped connection. The signal is `AppStatus.should_exit`, which sse-starlette flips from
+    uvicorn's `handle_exit` on SIGTERM. Raw ASGI because the assertion is the wire framing,
+    which the in-process bridge cannot observe.
+
+    Runs on trio's autojumping MockClock so the shutdown poll takes no wall-clock time."""
+    server = Server("test", on_subscriptions_listen=ListenHandler(InMemorySubscriptionBus()))
+    body = json.dumps(_listen_body()).encode()
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "server": ("testserver", 80),
+        "client": ("127.0.0.1", 1234),
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"accept", b"application/json, text/event-stream"),
+            (MCP_PROTOCOL_VERSION_HEADER.encode(), LATEST_MODERN_VERSION.encode()),
+            (MCP_METHOD_HEADER.encode(), b"subscriptions/listen"),
+        ],
+    }
+    request_delivered = anyio.Event()
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        if request_delivered.is_set():
+            await anyio.Event().wait()  # the client stays connected for the whole test
+        request_delivered.set()
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+        if message["type"] == "http.response.body":
+            # Shutdown begins once the first event has reached the client, so the stream is open.
+            monkeypatch.setattr(AppStatus, "should_exit", True)
+
+    with anyio.fail_after(5):
+        async with server.lifespan(server) as lifespan_state:
+            await handle_modern_request(server, None, False, lifespan_state, scope, receive, send)
+
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 200
+    assert (b"content-type", b"text/event-stream") in sent[0]["headers"]
+    bodies = sent[1:]
+    assert [chunk["more_body"] for chunk in bodies] == [True, False]
+    assert bodies[-1]["body"] == b""
+    events = _sse_payloads(bodies[0]["body"].decode())
+    assert [event["method"] for event in events] == ["notifications/subscriptions/acknowledged"]
