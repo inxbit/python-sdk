@@ -46,6 +46,7 @@ from mcp_types import (
 )
 from mcp_types import methods as _methods
 from pydantic import ValidationError
+from sse_starlette.sse import AppStatus
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
@@ -142,6 +143,9 @@ async def _to_jsonrpc_response(
 
 _SSE_PING_INTERVAL: float = 15.0
 """Seconds between SSE comment-line keepalives once `text/event-stream` has committed."""
+
+_SHUTDOWN_POLL_INTERVAL: float = 0.5
+"""Seconds between checks of `AppStatus.should_exit` while an SSE response is open."""
 
 
 def _sse_event(msg: JSONRPCResponse | JSONRPCError | JSONRPCNotification) -> bytes:
@@ -480,9 +484,25 @@ async def handle_modern_request(
             pass  # pragma: no cover
         cancel_scope.cancel()
 
+    streaming = False
+    shutting_down = False
+
+    async def watch_shutdown(cancel_scope: anyio.CancelScope) -> None:
+        # sse-starlette patches uvicorn's `Server.handle_exit`, so `AppStatus.should_exit` flips on
+        # the first SIGTERM/SIGINT. uvicorn waits for open connections before it runs the lifespan
+        # shutdown, so this flag is the only shutdown signal an open stream can observe (#3806).
+        # Acting only once `text/event-stream` has committed leaves a still-deferred handler free
+        # to finish and answer as JSON.
+        nonlocal shutting_down
+        while not (AppStatus.should_exit and streaming):
+            await anyio.sleep(_SHUTDOWN_POLL_INTERVAL)
+        shutting_down = True
+        cancel_scope.cancel()
+
     async with recv_ch, anyio.create_task_group() as tg:
         tg.start_soon(run_handler)
         tg.start_soon(watch_disconnect, tg.cancel_scope)
+        tg.start_soon(watch_shutdown, tg.cancel_scope)
 
         event: bytes | None = None
         done = False
@@ -514,6 +534,7 @@ async def handle_modern_request(
                     ],
                 }
             )
+            streaming = True
             while not done:
                 await send({"type": "http.response.body", "body": event or b": ping\r\n\r\n", "more_body": True})
                 event = None
@@ -522,6 +543,13 @@ async def handle_modern_request(
                         event = await recv_ch.receive()
                     except anyio.EndOfStream:
                         done = True
+            streaming = False
             await send({"type": "http.response.body", "body": _sse_event(result[0]), "more_body": False})
 
         tg.cancel_scope.cancel()
+
+    if shutting_down:
+        # The stream was cut mid-flight by shutdown with the client still connected: close the
+        # response properly so the client sees a clean end rather than a dropped connection, and
+        # uvicorn does not log an incomplete response.
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
